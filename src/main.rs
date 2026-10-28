@@ -82,7 +82,8 @@ fn run() -> Result<()> {
                 OutputFormat::Csv => accounts::AccountFormat::Csv,
             };
             let count = workflow::decode_images(&input, &output, account_format)?;
-            println!("Decoded {} account(s) into {}", count, output.display());
+            let accounts = if count == 1 { "account" } else { "accounts" };
+            println!("Decoded {count} {accounts} into {}", output.display());
         }
         Command::Encode {
             input,
@@ -95,12 +96,8 @@ fn run() -> Result<()> {
                 EncodeFormat::Migration => "migration",
                 EncodeFormat::Otpauth => "individual otpauth",
             };
-            println!(
-                "Wrote {} {} QR code(s) to {}",
-                count,
-                kind,
-                output_dir.display()
-            );
+            let codes = if count == 1 { "QR code" } else { "QR codes" };
+            println!("Wrote {count} {kind} {codes} to {}", output_dir.display());
         }
     }
 

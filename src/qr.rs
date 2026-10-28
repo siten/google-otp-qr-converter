@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use image::{GrayImage, Luma};
 use qrcodegen::{QrCode, QrCodeEcc};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Authenticator 7.2 draws export QR codes with ZXing error correction M and a
@@ -16,18 +17,30 @@ pub fn scan_image(path: &Path) -> Result<Vec<String>> {
     let image = image::open(path)
         .with_context(|| format!("cannot open image {}", path.display()))?
         .to_luma8();
-    let mut prepared = rqrr::PreparedImage::prepare(image);
-    let grids = prepared.detect_grids();
-    if grids.is_empty() {
+    scan_luma(image)
+}
+
+fn scan_luma(image: GrayImage) -> Result<Vec<String>> {
+    let width = image.width();
+    let height = image.height();
+    let mut hints = rxing::DecodeHints {
+        PossibleFormats: Some(HashSet::from([rxing::BarcodeFormat::QR_CODE])),
+        ..rxing::DecodeHints::default()
+    };
+    let results = rxing::helpers::detect_multiple_in_luma_with_hints(
+        image.into_raw(),
+        width,
+        height,
+        &mut hints,
+    )
+    .context("no QR code detected")?;
+    if results.is_empty() {
         bail!("no QR code detected");
     }
-
-    let mut qr_texts = Vec::new();
-    for grid in grids {
-        let (_metadata, text) = grid.decode().context("could not decode detected QR code")?;
-        qr_texts.push(text);
-    }
-    Ok(qr_texts)
+    Ok(results
+        .into_iter()
+        .map(|result| result.getText().to_owned())
+        .collect())
 }
 
 pub fn write_png(text: &str, path: &Path) -> Result<()> {
@@ -97,5 +110,25 @@ mod tests {
             [0]
         );
         assert_eq!(image.get_pixel(offset - 1, offset).0, [255]);
+    }
+
+    #[test]
+    fn scan_failure_keeps_the_detector_error() {
+        let path = std::env::temp_dir().join(format!(
+            "google-otp-qr-blank-{}-{}.png",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        GrayImage::from_pixel(32, 32, Luma([255]))
+            .save(&path)
+            .unwrap();
+        let error = scan_image(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        let message = format!("{error:#}");
+        assert!(message.contains("no QR code detected"), "{message}");
+        assert!(message.contains("NotFoundException"), "{message}");
     }
 }
