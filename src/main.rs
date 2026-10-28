@@ -22,7 +22,7 @@ struct Cli {
 enum Command {
     /// Decode one or more Google Authenticator/otpauth QR images to JSON or CSV.
     Decode {
-        /// QR image path. Repeat -i for every migration QR; pass the final-index QR last.
+        /// QR image path. Repeat -i for each image. Order does not matter, and missing images are kept as a partial batch.
         #[arg(short, long, required = true)]
         input: Vec<PathBuf>,
         /// Output data file.

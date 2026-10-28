@@ -1,65 +1,64 @@
 use crate::accounts::{self, AccountFormat, OtpAccount};
 use crate::{EncodeFormat, google_migration, qr};
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Decode pipeline: image -> QR text -> OTP accounts -> JSON/CSV.
+///
+/// Migration images may arrive in any order, and a missing image is omitted.
+/// A repeated batch index keeps the first image and drops the later ones.
+/// Payloads with no batch index are all kept, after the indexed accounts.
 pub fn decode_images(inputs: &[PathBuf], output: &Path, format: AccountFormat) -> Result<usize> {
-    let mut accounts = Vec::new();
-    // Authenticator 7.2 has no batch ID. It accepts one batch at a time and
-    // identifies its QR files by their shared size and unique zero-based index.
-    let mut migration_batch_size = None;
-    let mut migration_indexes = HashSet::new();
+    let mut decoded = Vec::new();
+    let mut indexed: BTreeMap<i32, Vec<OtpAccount>> = BTreeMap::new();
+    let mut unindexed = Vec::new();
+    let mut migration_started = false;
 
     for path in inputs {
         let qr_texts = qr::scan_image(path)
             .with_context(|| format!("failed to scan image {}", path.display()))?;
         for text in qr_texts {
             if text.starts_with("otpauth-migration://") {
-                let (mut decoded, batch) = google_migration::decode_uri(&text)?;
-                if let Some(expected_size) = migration_batch_size {
-                    if expected_size != batch.batch_size {
-                        anyhow::bail!("migration QR batch sizes do not match");
+                let (decoded_accounts, batch) = google_migration::decode_uri(&text)?;
+                if !migration_started {
+                    decoded.push(Decoded::Migration);
+                    migration_started = true;
+                }
+                match batch.batch_index {
+                    Some(index) if !indexed.contains_key(&index) => {
+                        indexed.insert(index, decoded_accounts);
                     }
-                } else {
-                    migration_batch_size = Some(batch.batch_size);
+                    Some(_) => {}
+                    None => unindexed.extend(decoded_accounts),
                 }
-
-                let final_index = batch.batch_size - 1;
-                if batch.batch_index == final_index
-                    && migration_indexes.len() != final_index as usize
-                {
-                    anyhow::bail!(
-                        "final-index migration QR arrived before the other batch QR codes"
-                    );
-                }
-                if !migration_indexes.insert(batch.batch_index) {
-                    anyhow::bail!("duplicate migration QR batch index {}", batch.batch_index);
-                }
-                accounts.append(&mut decoded);
             } else if text.starts_with("otpauth://") {
-                accounts.push(accounts::decode_otpauth_uri(&text)?);
+                decoded.push(Decoded::Account(accounts::decode_otpauth_uri(&text)?));
             } else {
                 anyhow::bail!("QR code is not an otpauth or Google migration QR");
             }
         }
     }
 
+    let mut migration_accounts = indexed.into_values().flatten().collect::<Vec<_>>();
+    migration_accounts.append(&mut unindexed);
+    let mut accounts = Vec::new();
+    for item in decoded {
+        match item {
+            Decoded::Account(account) => accounts.push(account),
+            Decoded::Migration => accounts.append(&mut migration_accounts),
+        }
+    }
     if accounts.is_empty() {
         anyhow::bail!("no OTP accounts found in the supplied QR images");
     }
-    if let Some(batch_size) = migration_batch_size
-        && migration_indexes.len() != batch_size as usize
-    {
-        anyhow::bail!(
-            "incomplete migration batch: scanned {} of {batch_size} QR codes",
-            migration_indexes.len()
-        );
-    }
-    validate_accounts(&accounts)?;
     accounts::write_accounts(output, format, &accounts)?;
     Ok(accounts.len())
+}
+
+enum Decoded {
+    Account(OtpAccount),
+    Migration,
 }
 
 /// Encode pipeline: JSON/CSV -> OTP accounts -> URI/protobuf text -> QR PNG.
@@ -73,14 +72,12 @@ pub fn encode_file(
     if accounts.is_empty() {
         anyhow::bail!("input contains no OTP accounts");
     }
-    validate_accounts(&accounts)?;
-    std::fs::create_dir_all(output_dir)
-        .with_context(|| format!("cannot create output directory {}", output_dir.display()))?;
-
     let uris = match format {
         EncodeFormat::Migration => google_migration::encode_uris(&accounts, accounts_per_qr)?,
         EncodeFormat::Otpauth => accounts::encode_otpauth_uris(&accounts)?,
     };
+    std::fs::create_dir_all(output_dir)
+        .with_context(|| format!("cannot create output directory {}", output_dir.display()))?;
 
     for (index, uri) in uris.iter().enumerate() {
         let filename = match format {
@@ -95,9 +92,67 @@ pub fn encode_file(
     Ok(uris.len())
 }
 
-fn validate_accounts(accounts: &[OtpAccount]) -> Result<()> {
-    for account in accounts {
-        account.validate()?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names_from(inputs: &[PathBuf], output: &Path) -> Vec<String> {
+        decode_images(inputs, output, AccountFormat::Json).unwrap();
+        accounts::read_accounts(output)
+            .unwrap()
+            .into_iter()
+            .map(|account| account.name)
+            .collect()
     }
-    Ok(())
+
+    #[test]
+    fn migration_scan_keeps_partial_reordered_and_unindexed_images() {
+        let dir = std::env::temp_dir().join(format!(
+            "google-otp-qr-converter-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, uri: &str| {
+            let path = dir.join(format!("{name}.png"));
+            qr::write_png(uri, &path).unwrap();
+            path
+        };
+        let first = write(
+            "first",
+            &google_migration::account_migration_uri("first", Some(0), Some(3)),
+        );
+        let second = write(
+            "second",
+            &google_migration::account_migration_uri("second", Some(0), Some(9)),
+        );
+        let third = write(
+            "third",
+            &google_migration::account_migration_uri("third", Some(2), Some(3)),
+        );
+        let loose_a = write(
+            "loose-a",
+            &google_migration::account_migration_uri("loose-a", None, None),
+        );
+        let loose_b = write(
+            "loose-b",
+            &google_migration::account_migration_uri("loose-b", None, None),
+        );
+
+        // Index 2 before either index 0, index 1 missing, index 0 repeated.
+        // `second` is the first index 0, so `first` is dropped. Images with
+        // no index are all kept after the indexed accounts.
+        let names = names_from(
+            &[third.clone(), second, loose_a, first.clone(), loose_b],
+            &dir.join("accounts.json"),
+        );
+        assert_eq!(names, vec!["second", "third", "loose-a", "loose-b"]);
+
+        let partial = names_from(&[third, first], &dir.join("partial.json"));
+        assert_eq!(partial, vec!["first", "third"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

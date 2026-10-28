@@ -9,7 +9,7 @@ decode: image -> QR text -> Google migration/otpauth parser -> OTP accounts -> J
 encode: JSON/CSV -> OTP accounts -> migration protobuf/URI or individual otpauth URI -> QR text -> PNG
 ```
 
-The code follows those boundaries: `qr.rs` handles only QR image/text, `google_migration.rs` owns the migration URI and protobuf schema, `accounts.rs` owns the account model, JSON/CSV, and single-account `otpauth://` decoding, and `workflow.rs` connects the stages. A future protobuf change should be localized to `google_migration.rs`.
+The code follows those boundaries: `qr.rs` handles only QR image/text, `google_migration.rs` owns the migration URI and protobuf schema, `accounts.rs` owns the account model, JSON/CSV, and single-account `otpauth://` encoding and decoding, and `workflow.rs` connects the stages. A future protobuf change should be localized to `google_migration.rs`.
 
 ## Build
 
@@ -26,7 +26,7 @@ google-otp-qr-converter decode -i .\export.png -o .\accounts.json
 google-otp-qr-converter decode -i .\batch-1.png -i .\batch-2.png -o .\accounts.csv --format csv
 ```
 
-The decoder accepts Google migration QR images and individual `otpauth://` QR images. Repeat `-i` to process multiple image files.
+The decoder accepts Google migration QR images and individual `otpauth://` QR images. Repeat `-i` to process multiple image files. Migration images can arrive in any order. A missing image is left out. When two images share a batch index, the later one is ignored. Images with no batch index are all included, after the indexed accounts, in scan order. Indexed accounts are written in index order.
 
 ## Create QR code(s) from JSON or CSV
 
@@ -37,7 +37,7 @@ google-otp-qr-converter encode -i .\accounts.json -o .\migration-qrs
 google-otp-qr-converter encode -i .\accounts.csv -o .\migration-qrs --accounts-per-qr 8
 ```
 
-For 1–10 accounts, one migration QR is written; 11–20 accounts produce two. Scan every QR in a multi-QR batch, with the final-index QR last. `--accounts-per-qr` can lower the batch size, but not raise it above 10.
+For 1–10 accounts, one migration QR is written; 11–20 accounts produce two. `--accounts-per-qr` can lower the batch size, but not raise it above 10.
 
 To create standard `otpauth://` QR images instead, pass `--format otpauth`. It writes one independent QR per account (one account = one image, N accounts = N images):
 
@@ -45,11 +45,11 @@ To create standard `otpauth://` QR images instead, pass `--format otpauth`. It w
 google-otp-qr-converter encode -i .\accounts.json -o .\account-qrs --format otpauth
 ```
 
-Existing QR image files are not overwritten.
+Existing QR image files are not overwritten. Each PNG uses error correction M and the 7.2 export sizing: the bitmap is `max(600, modules + 8)` pixels on each side, and each module is a whole number of pixels centered in that square, which keeps a quiet zone of at least 4 modules.
 
 ## JSON schema
 
-The decoder writes a JSON array. `type` is `totp` or `hotp`; `secret` is unpadded Base32. The common account record includes `algorithm`, `digits`, `period`, and `counter`. For `otpauth://` scans, period is set to 30 seconds to match Authenticator 7.2, which ignores the URI's `period` parameter.
+The decoder writes a JSON array. A scan requires the account name, the secret, and the OTP type. `otpauth://` type must be `totp` or `hotp`. A migration type of 1 or 2 is `hotp` or `totp`; any other present type wire value is kept as its decimal text, and a missing or 0 type is rejected. Every other field is copied when the QR carries it and left empty when it does not: `algorithm`, `issuer`, and `unique_id` are `""`, and `digits`, `period`, and `counter` are `null`. Migration payloads have no period, and a TOTP parameter has no counter, so a normal export scan looks like this:
 
 ```json
 [
@@ -60,12 +60,17 @@ The decoder writes a JSON array. `type` is `totp` or `hotp`; `secret` is unpadde
     "type": "totp",
     "algorithm": "SHA1",
     "digits": 6,
-    "period": 30,
-    "counter": 0
+    "period": null,
+    "counter": null,
+    "unique_id": ""
   }
 ]
 ```
 
-CSV uses the same fields as headers. When importing older files, omitted algorithm/digits/period/type/counter values default to SHA1/6/30/TOTP/0.
+`unique_id` is migration protobuf field 8. The 7.2 exporter writes it and the QR importer replaces it with a new id; this tool keeps the exported value. The example above is empty only because that field was absent.
 
-Google Authenticator 7.2 exports migration payloads with version 2, up to 10 OTP parameters per QR, `batch_size`, and zero-based `batch_index`; its schema has no `batch_id`. Its standard `otpauth://` parser ignores the `period` parameter, so the tool rejects non-30-second TOTP records for either QR output format. Migration data supports SHA1/SHA256/SHA512 and 6/7/8 digits; unsupported values are rejected instead of silently changed.
+CSV uses the same fields as headers. When importing older files, a missing algorithm, digits, period, type, or counter defaults to SHA1, 6, 30, TOTP, or 0. JSON `null` leaves `digits`, `period`, and `counter` empty. An empty CSV cell leaves those three empty as well. `algorithm` and `type` are strings; JSON `null` is rejected for them.
+
+Google Authenticator 7.2 exports migration payloads with version 2, up to 10 OTP parameters per QR, `batch_size`, and zero-based `batch_index`. The schema has no `batch_id`. Scan does not require the version, a complete batch, or a known algorithm or digit count. Digit wire 0 and a missing digit field stay null; wire 1, 2, and 3 are stored as 6, 8, and 7; any other non-negative value is stored as that integer. Algorithm wire 0 and a missing algorithm stay `""`; wire 1, 2, and 3 are SHA1, SHA256, and SHA512; any other value is stored as its decimal wire number. Encode still requires a non-empty name and secret, type `totp` or `hotp`, algorithm SHA1/SHA256/SHA512, and 6/7/8 digits. An `otpauth://` scan keeps the period written in the QR, so `period=60` stays 60 in JSON/CSV. Authenticator 7.2 ignores that parameter and imports the account as 30 seconds; this tool does not rewrite the scan to that import result. Encode treats a missing period as 30 and leaves the stored `null` unchanged, and it rejects an explicit period other than 30. A migration counter is stored as the full uint64. Encode still rejects a HOTP counter above Authenticator's 32-bit range, and it does not fill other empty scan fields.
+
+The 7.2 rules live in `AUTHENTICATOR_7_2` and the wire maps in `src/google_migration.rs`. On that profile, `min_readable_version`, `max_readable_version`, and `default_batch_size` are documentation of the APK and are not applied by scan or encode. The single-account `otpauth://` parser is in `src/accounts.rs`. A newer export should be handled by updating that profile and those maps.
