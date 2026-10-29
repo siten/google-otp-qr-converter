@@ -144,17 +144,27 @@ impl OtpAccount {
 
     /// Encode check. Scan uses [`require_scanned_account`] instead, which only
     /// requires a name, a secret, and a type.
+    ///
+    /// Migration QR codes use this strict form. An `otpauth://` URI allows an
+    /// empty algorithm and empty digits; see [`validate_for_otpauth_qr`].
     pub fn validate(&self) -> Result<()> {
+        self.validate_fields(false)
+    }
+
+    fn validate_fields(&self, allow_empty_algorithm_and_digits: bool) -> Result<()> {
         require_scanned_account(self)?;
         if let OtpType::Other(value) = self.otp_type {
             bail!("OTP type {value} cannot be written as an Authenticator QR");
         }
-        canonical_algorithm(&self.algorithm)?;
+        if !(allow_empty_algorithm_and_digits && self.algorithm.trim().is_empty()) {
+            canonical_algorithm(&self.algorithm)?;
+        }
         match self.digits {
             Some(digits) if (6..=8).contains(&digits) => {}
             Some(digits) => {
                 bail!("Google Authenticator supports 6, 7, or 8 OTP digits, got {digits}")
             }
+            None if allow_empty_algorithm_and_digits => {}
             None => bail!("OTP digits are empty"),
         }
         if self.otp_type == OtpType::Hotp {
@@ -187,6 +197,17 @@ pub(crate) fn require_scanned_account(account: &OtpAccount) -> Result<()> {
 /// is not rewritten; only an explicit period other than 30 is rejected.
 pub fn validate_for_authenticator_qr(account: &OtpAccount) -> Result<()> {
     account.validate()?;
+    reject_explicit_non_default_period(account)
+}
+
+/// `otpauth://` encode check. An empty algorithm or empty digits is left empty.
+/// A present value uses the same rules as a migration QR.
+fn validate_for_otpauth_qr(account: &OtpAccount) -> Result<()> {
+    account.validate_fields(true)?;
+    reject_explicit_non_default_period(account)
+}
+
+fn reject_explicit_non_default_period(account: &OtpAccount) -> Result<()> {
     if account.otp_type == OtpType::Totp && matches!(account.period, Some(period) if period != 30) {
         bail!(
             "Google Authenticator 7.2 only preserves a 30 second TOTP period for {:?}",
@@ -411,7 +432,7 @@ pub fn encode_otpauth_uris(accounts: &[OtpAccount]) -> Result<Vec<String>> {
     accounts
         .iter()
         .map(|account| {
-            validate_for_authenticator_qr(account)?;
+            validate_for_otpauth_qr(account)?;
             if account.issuer.contains(':') || account.name.contains(':') {
                 bail!(
                     "otpauth label cannot preserve ':' in {:?} / {:?}; Authenticator 7.2 keeps only the second colon-separated segment",
@@ -424,8 +445,6 @@ pub fn encode_otpauth_uris(accounts: &[OtpAccount]) -> Result<Vec<String>> {
                 OtpType::Hotp => "hotp",
                 OtpType::Other(value) => bail!("OTP type {value} cannot be written as an otpauth URI"),
             };
-            let algorithm = canonical_algorithm(&account.algorithm)?;
-            let digits = account.digits.context("OTP digits are empty")?;
             let mut uri = Url::parse(&format!("otpauth://{scheme_type}/"))?;
             let label = if account.issuer.is_empty() {
                 account.name.clone()
@@ -433,11 +452,14 @@ pub fn encode_otpauth_uris(accounts: &[OtpAccount]) -> Result<Vec<String>> {
                 format!("{}:{}", account.issuer, account.name)
             };
             uri.set_path(&label);
-            let mut pairs = vec![
-                ("secret", normalize_secret(&account.secret)),
-                ("algorithm", algorithm.as_str().to_owned()),
-                ("digits", digits.to_string()),
-            ];
+            let mut pairs = vec![("secret", normalize_secret(&account.secret))];
+            if !account.algorithm.trim().is_empty() {
+                let algorithm = canonical_algorithm(&account.algorithm)?;
+                pairs.push(("algorithm", algorithm.as_str().to_owned()));
+            }
+            if let Some(digits) = account.digits {
+                pairs.push(("digits", digits.to_string()));
+            }
             if !account.issuer.is_empty() {
                 pairs.push(("issuer", account.issuer.clone()));
             }
@@ -572,6 +594,38 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn otpauth_leaves_empty_algorithm_and_digits_unchanged() {
+        let mut account = OtpAccount {
+            issuer: String::new(),
+            name: "alice".into(),
+            secret: "JBSWY3DPEHPK3PXP".into(),
+            otp_type: OtpType::Totp,
+            algorithm: String::new(),
+            digits: None,
+            period: None,
+            counter: None,
+            unique_id: String::new(),
+        };
+        let uri = encode_otpauth_uris(std::slice::from_ref(&account))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(!uri.contains("algorithm="));
+        assert!(!uri.contains("digits="));
+        let decoded = decode_otpauth_uri(&uri).unwrap();
+        assert_eq!(decoded.algorithm, "");
+        assert_eq!(decoded.digits, None);
+        assert_eq!(account.algorithm, "");
+        assert_eq!(account.digits, None);
+
+        account.algorithm = "MD5".into();
+        assert!(encode_otpauth_uris(std::slice::from_ref(&account)).is_err());
+        account.algorithm.clear();
+        account.digits = Some(4);
+        assert!(encode_otpauth_uris(std::slice::from_ref(&account)).is_err());
     }
 
     #[test]
